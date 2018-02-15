@@ -19,8 +19,11 @@
 #include <MiLightDiscoveryServer.h>
 #include <MiLightClient.h>
 #include <BulbStateUpdater.h>
+#include <LEDStatus.h>
 
 WiFiManager wifiManager;
+
+static LEDStatus *ledStatus;
 
 Settings settings;
 
@@ -85,6 +88,10 @@ void onPacketSentHandler(uint8_t* packet, const MiLightRemoteConfig& config) {
   StaticJsonBuffer<200> buffer;
   JsonObject& result = buffer.createObject();
   BulbId bulbId = config.packetFormatter->parsePacket(packet, result, stateStore);
+
+
+  // blip LED to indicate we saw a packet (send or receive)
+  ledStatus->oneshot(LEDStatus::LEDMode::Flicker, 3);
 
   if (&bulbId == &DEFAULT_BULB_ID) {
     Serial.println(F("Skipping packet handler because packet was not decoded"));
@@ -226,6 +233,10 @@ void applySettings() {
     discoveryServer = new MiLightDiscoveryServer(settings);
     discoveryServer->begin();
   }
+
+  // update LED pin
+  if (ledStatus)
+    ledStatus->changePin(settings.ledPin);
 }
 
 /**
@@ -239,20 +250,43 @@ bool shouldRestart() {
   return settings.getAutoRestartPeriod()*60*1000 < millis();
 }
 
+// give a bit of time to update the status LED
+void handleLED() {
+  ledStatus->handle();
+}
+
 void setup() {
   Serial.begin(9600);
   String ssid = "ESP" + String(ESP.getChipId());
-
-  wifiManager.setConfigPortalTimeout(180);
-  wifiManager.autoConnect(ssid.c_str(), "milightHub");
-
+  
+  // load up our persistent settings from the file system
   SPIFFS.begin();
   Settings::load(settings);
   applySettings();
 
+  // set up the LED status
+  ledStatus = new LEDStatus(settings.ledPin);
+  ledStatus->continuous(LEDStatus::LEDMode::FastToggle);
+
+  // start up the wifi manager
   if (! MDNS.begin("milight-hub")) {
     Serial.println(F("Error setting up MDNS responder"));
   }
+  // tell Wifi manager to call us during the setup.  Note that this "setSetupLoopCallback" is an addition
+  // made to Wifi manager in a private fork.  As of this writing, WifiManager has a new feature coming that
+  // allows the "autoConnect" method to be non-blocking which can implement this same functionality.  However,
+  // that change is only on the development branch so we are going to continue to use this fork until
+  // that is merged and ready.
+  wifiManager.setSetupLoopCallback(handleLED);
+  wifiManager.setConfigPortalTimeout(180);
+  if (wifiManager.autoConnect(ssid.c_str(), "milightHub")) {
+    ledStatus->continuous(LEDStatus::LEDMode::SlowBlip);
+    Serial.printf("Wifi connected succesfully\n");
+  } else {
+    ledStatus->continuous(LEDStatus::LEDMode::On);
+    Serial.printf("Wifi failed.  Oh well.\n");
+  }
+
 
   MDNS.addService("http", "tcp", 80);
 
@@ -293,6 +327,9 @@ void loop() {
   handleListen();
 
   stateStore->limitedFlush();
+
+  // update LED with status
+  ledStatus->handle();
 
   if (shouldRestart()) {
     Serial.println(F("Auto-restart triggered. Restarting..."));
